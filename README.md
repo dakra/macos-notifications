@@ -46,6 +46,36 @@ the notification.  `:replaces-id` replaces the callback too, so pass
 `:on-action` again.  `macos-notifications-close` removes a notification
 from Notification Center.
 
+`macos-notifications-show-buffer` returns an `:on-action` function that
+shows a buffer, the current one by default: it selects the window already
+showing it, else pops to it, and focuses that frame.
+
+### ghostel
+
+[ghostel](https://github.com/dakra/ghostel) runs
+`ghostel-notification-functions` with `(TITLE BODY)` for OSC 9 / OSC 777
+notifications (Claude Code emits them when it needs attention) and for its
+own program-status changes, the terminal buffer current.  Replace the
+default `alert` handler so a click jumps to that terminal:
+
+```elisp
+(defun my-ghostel-notify (title body)
+  (macos-notifications-notify
+   :title (if (string-empty-p title) (buffer-name) title)
+   :body body
+   :on-action (macos-notifications-show-buffer)))
+
+(with-eval-after-load 'ghostel-status
+  (remove-hook 'ghostel-notification-functions #'ghostel-default-notify)
+  (add-hook 'ghostel-notification-functions #'my-ghostel-notify))
+```
+
+or simply, when nothing else needs to stay on the hook:
+
+```elisp
+(setq ghostel-notification-functions '(my-ghostel-notify))
+```
+
 ## Limits
 
 - No icon override, action buttons, dismiss callback or timeout: macOS

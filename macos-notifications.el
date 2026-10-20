@@ -163,5 +163,16 @@ is clicked; KEY is \"default\" for a click on the notification body."
   (remhash id macos-notifications--callbacks)
   (macos-notifications--close id))
 
+(defun macos-notifications-show-buffer (&optional buffer)
+  "Return an `:on-action' function that shows BUFFER, default the current one.
+Selects the window already showing BUFFER, else pops to it, and
+focuses that frame."
+  (let ((buf (or buffer (current-buffer))))
+    (lambda (_id _key)
+      (when (buffer-live-p buf)
+        (let ((win (get-buffer-window buf t)))
+          (if win (select-window win) (pop-to-buffer buf)))
+        (select-frame-set-input-focus (selected-frame))))))
+
 (provide 'macos-notifications)
 ;;; macos-notifications.el ends here
