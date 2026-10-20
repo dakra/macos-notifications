@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: 'snapshot'
+
+      - name: Install package-lint
+        run: |
+          emacs -Q --batch --eval "(progn (require 'package) \
+            (push '(\"melpa\" . \"https://melpa.org/packages/\") package-archives) \
+            (package-refresh-contents) \
+            (package-install 'package-lint))"
+
+      - name: Lint
+        run: make lint
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs_version: ['28.2', 'snapshot']
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Build
+        run: make
+
+      - name: Test
+        run: make test
