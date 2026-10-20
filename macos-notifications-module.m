@@ -134,9 +134,15 @@ Fopen (emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
   int fd = env->open_channel (env, args[0]);
   if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
     return nil_value (env);
+  /* dup2 swaps the target atomically, so a callback thread holding
+     the old number keeps a valid descriptor.  */
   if (channel_fd >= 0)
-    close (channel_fd);
-  channel_fd = fd;
+    {
+      dup2 (fd, channel_fd);
+      close (fd);
+    }
+  else
+    channel_fd = fd;
 
   if (delegate == nil)
     {

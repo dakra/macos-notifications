@@ -80,6 +80,9 @@
 (defvar macos-notifications--callbacks (make-hash-table)
   "Notification id -> `:on-action' function.")
 
+(defvar macos-notifications--ids nil
+  "Ids with a registered callback, newest first.")
+
 (defvar macos-notifications--process nil
   "Pipe process the module writes notification events to.")
 
@@ -112,7 +115,7 @@ System Settings > Notifications"))
   (let ((lines (split-string (concat macos-notifications--pending output) "\n")))
     (setq macos-notifications--pending (car (last lines)))
     (dolist (line (butlast lines))
-      (unless (string-empty-p line)
+      (unless (equal line "")
         (macos-notifications--dispatch line)))))
 
 (defun macos-notifications--ensure-channel ()
@@ -127,13 +130,15 @@ System Settings > Notifications"))
       (setq macos-notifications--pending ""
             macos-notifications--process process))))
 
-(defun macos-notifications--prune ()
-  "Drop callbacks older than the newest 256 ids."
-  (let ((floor (- macos-notifications--counter 255)))
-    (maphash (lambda (id _)
-               (when (< id floor)
-                 (remhash id macos-notifications--callbacks)))
-             macos-notifications--callbacks)))
+(defun macos-notifications--register (id fn)
+  "Store FN as the callback for ID, keeping only the newest 256."
+  (puthash id fn macos-notifications--callbacks)
+  (setq macos-notifications--ids (cons id (delq id macos-notifications--ids)))
+  (let ((tail (nthcdr 255 macos-notifications--ids)))
+    (dolist (old (cdr tail))
+      (remhash old macos-notifications--callbacks))
+    (when tail
+      (setcdr tail nil))))
 
 ;;;###autoload
 (cl-defun macos-notifications-notify (&key title body sound replaces-id on-action)
@@ -142,15 +147,15 @@ TITLE and BODY are strings.  SOUND non-nil plays the default sound.
 REPLACES-ID replaces the notification with that id, including its
 ON-ACTION.  ON-ACTION is called with (ID KEY) when the notification
 is clicked; KEY is \"default\" for a click on the notification body."
-  (unless (eq (window-system) 'ns)
+  (unless (cl-some (lambda (f) (eq (window-system f) 'ns)) (frame-list))
     (user-error "Notifications need a GUI Emacs.app frame"))
   (macos-notifications--ensure-channel)
   (let ((id (or replaces-id (cl-incf macos-notifications--counter))))
-    (macos-notifications--prune)
-    (if on-action
-        (puthash id on-action macos-notifications--callbacks)
-      (remhash id macos-notifications--callbacks))
     (macos-notifications--notify id (or title "") (or body "") sound)
+    (setq macos-notifications--counter (max macos-notifications--counter id))
+    (if on-action
+        (macos-notifications--register id on-action)
+      (remhash id macos-notifications--callbacks))
     id))
 
 (defun macos-notifications-close (id)

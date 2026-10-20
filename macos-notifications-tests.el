@@ -18,9 +18,10 @@
 (require 'macos-notifications)
 
 (defun macos-notifications-tests--run-timers ()
-  "Run every pending zero-delay timer."
+  "Run the pending callback timers."
   (dolist (timer (copy-sequence timer-list))
-    (timer-event-handler timer)))
+    (when (eq (timer--function timer) #'macos-notifications--run-callback)
+      (timer-event-handler timer))))
 
 (ert-deftest macos-notifications-tests-filter-dispatch ()
   (let ((macos-notifications--callbacks (make-hash-table))
@@ -49,18 +50,18 @@
 
 (ert-deftest macos-notifications-tests-prune ()
   (let ((macos-notifications--callbacks (make-hash-table))
-        (macos-notifications--counter 0))
-    (dotimes (_ 300)
-      (let ((id (cl-incf macos-notifications--counter)))
-        (puthash id #'ignore macos-notifications--callbacks)
+        (macos-notifications--ids nil))
+    (dotimes (i 300)
+      (let ((id (1+ i)))
+        (macos-notifications--register id #'ignore)
         (when (zerop (% id 7))
-          (remhash id macos-notifications--callbacks))
-        (macos-notifications--prune)))
+          (remhash id macos-notifications--callbacks))))
+    (macos-notifications--register 3 #'ignore)
     (let ((keys nil))
       (maphash (lambda (id _) (push id keys)) macos-notifications--callbacks)
       (should (equal (sort keys #'<)
-                     (cl-remove-if (lambda (id) (zerop (% id 7)))
-                                   (number-sequence 45 300)))))))
+                     (cons 3 (cl-remove-if (lambda (id) (zerop (% id 7)))
+                                           (number-sequence 46 300))))))))
 
 (ert-deftest macos-notifications-tests-auth-lines ()
   (let ((macos-notifications--callbacks (make-hash-table))
