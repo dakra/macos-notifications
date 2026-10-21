@@ -67,11 +67,33 @@ channel_write (const char *line)
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))handler
 {
+  NSString *ident = response.notification.request.identifier;
   NSString *action = response.actionIdentifier;
-  if ([action isEqualToString:UNNotificationDefaultActionIdentifier])
-    action = @"default";
-  NSString *line = [NSString stringWithFormat:@"%@ %@\n",
-                             response.notification.request.identifier, action];
+  NSString *line;
+  /* Notifications left over from an earlier Emacs session carry its pid.  */
+  NSString *prefix = [NSString stringWithFormat:@"%d-", getpid ()];
+  if (![ident hasPrefix:prefix])
+    {
+      handler ();
+      return;
+    }
+  ident = [ident substringFromIndex:prefix.length];
+  if ([response isKindOfClass:[UNTextInputNotificationResponse class]])
+    {
+      /* Percent-encode so the text fits in one space-separated line.  */
+      NSString *text = ((UNTextInputNotificationResponse *) response).userText;
+      NSString *encoded = [text stringByAddingPercentEncodingWithAllowedCharacters:
+                                  NSCharacterSet.alphanumericCharacterSet];
+      line = [NSString stringWithFormat:@"%@ reply %@\n", ident, encoded];
+    }
+  else
+    {
+      if ([action isEqualToString:UNNotificationDefaultActionIdentifier])
+        action = @"default";
+      else if ([action isEqualToString:UNNotificationDismissActionIdentifier])
+        action = @"dismiss";
+      line = [NSString stringWithFormat:@"%@ %@\n", ident, action];
+    }
   channel_write (line.UTF8String);
   handler ();
 }
@@ -118,13 +140,101 @@ to_nsstring (emacs_env *env, emacs_value v)
   return s;
 }
 
+/* Lisp string V as an NSString, nil for a Lisp nil.  */
+static NSString *
+opt_nsstring (emacs_env *env, emacs_value v)
+{
+  return env->is_not_nil (env, v) ? to_nsstring (env, v) : nil;
+}
+
+/* Vector of Lisp strings V as an array, empty for a Lisp nil.  */
+static NSArray<NSString *> *
+to_strings (emacs_env *env, emacs_value v)
+{
+  NSMutableArray *array = [NSMutableArray new];
+  if (!env->is_not_nil (env, v))
+    return array;
+  ptrdiff_t n = env->vec_size (env, v);
+  for (ptrdiff_t i = 0; i < n; i++)
+    {
+      NSString *s = to_nsstring (env, env->vec_get (env, v, i));
+      if (s == nil)
+        return nil;
+      [array addObject:s];
+    }
+  return array;
+}
+
+/* Request identifier for Lisp id V, prefixed with this process's pid.  */
 static NSString *
 id_string (emacs_env *env, emacs_value v)
 {
   intmax_t id = env->extract_integer (env, v);
   if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
     return nil;
-  return [NSString stringWithFormat:@"%jd", id];
+  return [NSString stringWithFormat:@"%d-%jd", getpid (), id];
+}
+
+/* (ACTIONS REPLY DISMISS) -> registered category.  */
+static NSMutableDictionary<NSArray *, UNNotificationCategory *> *categories;
+
+/* Identifier of the category with ACTIONS (key, label, ...), a text
+   field with placeholder REPLY and a reported DISMISS, registering it
+   with the center on first use.  nil when no category is needed.  */
+static NSString *
+category_for (NSArray<NSString *> *actions, NSString *reply, BOOL dismiss)
+{
+  if (actions.count == 0 && reply == nil && !dismiss)
+    return nil;
+  NSArray *key = @[ actions, reply ?: @"", @(dismiss) ];
+  UNNotificationCategory *category = categories[key];
+  if (category == nil)
+    {
+      NSMutableArray *list = [NSMutableArray new];
+      for (NSUInteger i = 0; i + 1 < actions.count; i += 2)
+        [list addObject:[UNNotificationAction actionWithIdentifier:actions[i]
+                                                             title:actions[i + 1]
+                                                           options:0]];
+      if (reply != nil)
+        [list addObject:[UNTextInputNotificationAction actionWithIdentifier:@"reply"
+                                                                      title:@"Reply"
+                                                                    options:0
+                                                       textInputButtonTitle:@"Send"
+                                                       textInputPlaceholder:reply]];
+      if (categories == nil)
+        categories = [NSMutableDictionary new];
+      NSString *ident = [NSString stringWithFormat:@"macos-notifications-%lu",
+                                  (unsigned long) categories.count];
+      category = [UNNotificationCategory categoryWithIdentifier:ident
+                                                        actions:list
+                                              intentIdentifiers:@[]
+                                                        options:(dismiss ? UNNotificationCategoryOptionCustomDismissAction : 0)];
+      categories[key] = category;
+      [[UNUserNotificationCenter currentNotificationCenter]
+        setNotificationCategories:[NSSet setWithArray:categories.allValues]];
+    }
+  return category.identifier;
+}
+
+/* Attachment for the image file at PATH, copied first because the
+   framework moves attached files into its own store.  nil with ERROR
+   set on failure.  */
+static UNNotificationAttachment *
+image_attachment (NSString *path, NSError **error)
+{
+  NSURL *src = [NSURL fileURLWithPath:path];
+  NSString *name = [@"macos-notifications-" stringByAppendingString:NSUUID.UUID.UUIDString];
+  NSURL *tmp = [[NSURL fileURLWithPath:NSTemporaryDirectory ()] URLByAppendingPathComponent:name];
+  if (src.pathExtension.length > 0)
+    tmp = [tmp URLByAppendingPathExtension:src.pathExtension];
+  if (![[NSFileManager defaultManager] copyItemAtURL:src toURL:tmp error:error])
+    return nil;
+  UNNotificationAttachment *attachment
+    = [UNNotificationAttachment attachmentWithIdentifier:@"image" URL:tmp
+                                                 options:nil error:error];
+  if (attachment == nil)
+    [[NSFileManager defaultManager] removeItemAtURL:tmp error:NULL];
+  return attachment;
 }
 
 static emacs_value
@@ -179,7 +289,10 @@ Fnotify (emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
   NSString *ident = id_string (env, args[0]);
   NSString *title = ident ? to_nsstring (env, args[1]) : nil;
   NSString *body = title ? to_nsstring (env, args[2]) : nil;
-  if (body == nil)
+  NSArray<NSString *> *actions = body ? to_strings (env, args[4]) : nil;
+  NSString *reply = actions ? opt_nsstring (env, args[5]) : nil;
+  NSString *image = actions ? opt_nsstring (env, args[8]) : nil;
+  if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
     return nil_value (env);
   if (delegate == nil)
     return signal_error (env, "Notification center not initialized");
@@ -187,8 +300,24 @@ Fnotify (emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
   UNMutableNotificationContent *content = [UNMutableNotificationContent new];
   content.title = title;
   content.body = body;
-  if (env->is_not_nil (env, args[3]))
+  emacs_value sound = args[3];
+  if (env->eq (env, env->type_of (env, sound), env->intern (env, "string")))
+    content.sound = [UNNotificationSound soundNamed:to_nsstring (env, sound)];
+  else if (env->is_not_nil (env, sound))
     content.sound = UNNotificationSound.defaultSound;
+  content.categoryIdentifier
+    = category_for (actions, reply, env->is_not_nil (env, args[6]));
+  if (@available (macOS 12.0, *))
+    if (env->is_not_nil (env, args[7]))
+      content.interruptionLevel = UNNotificationInterruptionLevelPassive;
+  if (image != nil)
+    {
+      NSError *error = nil;
+      UNNotificationAttachment *attachment = image_attachment (image, &error);
+      if (attachment == nil)
+        return signal_error (env, error.localizedDescription.UTF8String);
+      content.attachments = @[ attachment ];
+    }
   UNNotificationRequest *request
     = [UNNotificationRequest requestWithIdentifier:ident content:content trigger:nil];
   [[UNUserNotificationCenter currentNotificationCenter]
@@ -235,9 +364,13 @@ emacs_module_init (struct emacs_runtime *ert)
   defun (env, "macos-notifications--open", 1, Fopen,
          "Route notification events into pipe PROCESS and install the delegate.\n\n"
          "(fn PROCESS)");
-  defun (env, "macos-notifications--notify", 4, Fnotify,
-         "Post a notification ID with TITLE and BODY, playing the default sound if SOUND.\n\n"
-         "(fn ID TITLE BODY SOUND)");
+  defun (env, "macos-notifications--notify", 9, Fnotify,
+         "Post notification ID with TITLE and BODY.\n"
+         "SOUND is nil, t for the default sound or a sound name.  ACTIONS is a\n"
+         "vector of KEY LABEL strings.  REPLY is a placeholder string for a text\n"
+         "field or nil.  DISMISS non-nil reports an explicit dismissal.  PASSIVE\n"
+         "non-nil delivers quietly.  IMAGE is a local image file or nil.\n\n"
+         "(fn ID TITLE BODY SOUND ACTIONS REPLY DISMISS PASSIVE IMAGE)");
   defun (env, "macos-notifications--close", 1, Fclose,
          "Remove notification ID from Notification Center.\n\n(fn ID)");
 

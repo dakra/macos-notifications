@@ -37,6 +37,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'url-util)
 
 (unless (eq system-type 'darwin)
   (user-error "The macos-notifications package only works on macOS"))
@@ -78,10 +79,10 @@
   "Last notification id handed out.")
 
 (defvar macos-notifications--callbacks (make-hash-table)
-  "Notification id -> `:on-action' function.")
+  "Notification id -> list of `:on-action', `:on-reply' and `:on-close'.")
 
 (defvar macos-notifications--ids nil
-  "Ids with a registered callback, newest first.")
+  "Ids with registered callbacks, newest first.")
 
 (defvar macos-notifications--process nil
   "Pipe process the module writes notification events to.")
@@ -89,12 +90,17 @@
 (defvar macos-notifications--pending ""
   "Partial line received from the module, waiting for its newline.")
 
-(defun macos-notifications--run-callback (fn id key)
-  "Call FN with ID and KEY, reporting instead of propagating errors."
+(defun macos-notifications--run-callback (fn &rest args)
+  "Apply FN to ARGS, reporting instead of propagating errors."
   (condition-case err
-      (funcall fn id key)
+      (apply fn args)
     (error (message "macos-notifications callback error: %s"
                     (error-message-string err)))))
+
+(defun macos-notifications--schedule (fn &rest args)
+  "Apply FN to ARGS from a timer, unless FN is nil."
+  (when fn
+    (apply #'run-at-time 0 nil #'macos-notifications--run-callback fn args)))
 
 (defun macos-notifications--dispatch (line)
   "Handle one event LINE from the module."
@@ -103,12 +109,18 @@
      (message "Notifications for Emacs are disabled; allow Emacs in \
 System Settings > Notifications"))
     (`("auth" ,_))
-    (`(,id ,key)
-     (let* ((id (string-to-number id))
-            (fn (gethash id macos-notifications--callbacks)))
-       (remhash id macos-notifications--callbacks)
-       (when fn
-         (run-at-time 0 nil #'macos-notifications--run-callback fn id key))))))
+    (`(,id ,key . ,rest)
+     (let ((id (string-to-number id)))
+       (pcase-let ((`(,on-action ,on-reply ,on-close)
+                    (gethash id macos-notifications--callbacks)))
+         (remhash id macos-notifications--callbacks)
+         (pcase key
+           ("reply"
+            (macos-notifications--schedule
+             on-reply id
+             (decode-coding-string (url-unhex-string (or (car rest) "") t) 'utf-8)))
+           ("dismiss" (macos-notifications--schedule on-close id 'dismissed))
+           (_ (macos-notifications--schedule on-action id key))))))))
 
 (defun macos-notifications--filter (_process output)
   "Split OUTPUT into lines and dispatch each complete one."
@@ -130,9 +142,9 @@ System Settings > Notifications"))
       (setq macos-notifications--pending ""
             macos-notifications--process process))))
 
-(defun macos-notifications--register (id fn)
-  "Store FN as the callback for ID, keeping only the newest 256."
-  (puthash id fn macos-notifications--callbacks)
+(defun macos-notifications--register (id callbacks)
+  "Store CALLBACKS for ID, keeping only the newest 256 ids."
+  (puthash id callbacks macos-notifications--callbacks)
   (setq macos-notifications--ids (cons id (delq id macos-notifications--ids)))
   (let ((tail (nthcdr 255 macos-notifications--ids)))
     (dolist (old (cdr tail))
@@ -140,21 +152,48 @@ System Settings > Notifications"))
     (when tail
       (setcdr tail nil))))
 
+(defun macos-notifications--check-actions (actions)
+  "Signal an error unless ACTIONS is a list of usable KEY LABEL pairs."
+  (unless (listp actions)
+    (error "Actions must be a list, not %S" actions))
+  (let (keys)
+    (cl-loop for (key label) on actions by #'cddr
+             unless (and (stringp key) (stringp label)
+                         (not (equal key ""))
+                         (not (member key '("default" "reply" "dismiss")))
+                         (not (member key keys))
+                         (not (string-match-p "[ \t\n\r]" key)))
+             do (error "Invalid action: %S %S" key label)
+             do (push key keys))))
+
 ;;;###autoload
-(cl-defun macos-notifications-notify (&key title body sound replaces-id on-action)
+(cl-defun macos-notifications-notify (&key title body sound urgency image-path
+                                           actions reply replaces-id
+                                           on-action on-reply on-close)
   "Post a macOS notification and return its integer id.
-TITLE and BODY are strings.  SOUND non-nil plays the default sound.
-REPLACES-ID replaces the notification with that id, including its
-ON-ACTION.  ON-ACTION is called with (ID KEY) when the notification
-is clicked; KEY is \"default\" for a click on the notification body."
+TITLE and BODY are strings.  SOUND t plays the default sound,
+a string the system or user sound of that name.
+URGENCY `low' delivers quietly to the notification list.
+IMAGE-PATH is a local image file shown in the notification.
+ACTIONS is a flat list of KEY LABEL strings shown as buttons.
+REPLY, a placeholder string, adds a text field.
+REPLACES-ID replaces the notification with that id and its callbacks.
+ON-ACTION is called with (ID KEY), KEY being the button's key or
+\"default\" for a click on the body.
+ON-REPLY with (ID TEXT) for an entered reply; ON-CLOSE with
+\(ID \\='dismissed) when the user dismisses the notification."
+  (macos-notifications--check-actions actions)
   (unless (cl-some (lambda (f) (eq (window-system f) 'ns)) (frame-list))
     (user-error "Notifications need a GUI Emacs.app frame"))
   (macos-notifications--ensure-channel)
   (let ((id (or replaces-id (cl-incf macos-notifications--counter))))
-    (macos-notifications--notify id (or title "") (or body "") sound)
+    (macos-notifications--notify id (or title "") (or body "") sound
+                                 (and actions (vconcat actions)) reply
+                                 (and on-close t) (eq urgency 'low)
+                                 (and image-path (expand-file-name image-path)))
     (setq macos-notifications--counter (max macos-notifications--counter id))
-    (if on-action
-        (macos-notifications--register id on-action)
+    (if (or on-action on-reply on-close)
+        (macos-notifications--register id (list on-action on-reply on-close))
       (remhash id macos-notifications--callbacks))
     id))
 
