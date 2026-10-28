@@ -79,9 +79,9 @@ showing it, else pops to it, and focuses that frame.
 
 [ghostel](https://github.com/dakra/ghostel) runs
 `ghostel-notification-functions` with `(TITLE BODY)` for OSC 9 / OSC 777
-notifications (Claude Code emits them when it needs attention) and for its
-own program-status changes, the terminal buffer current.  Replace the
-default `alert` handler so a click jumps to that terminal:
+notifications and, through `ghostel-status-notify`, for program-status
+changes (OSC 7501, which Claude Code speaks), the terminal buffer current.
+Replace the default `alert` handler so a click jumps to that terminal:
 
 ```elisp
 (defun my-ghostel-notify (title body)
@@ -99,6 +99,61 @@ or simply, when nothing else needs to stay on the hook:
 
 ```elisp
 (setq ghostel-notification-functions '(my-ghostel-notify))
+```
+
+Program-status changes (OSC 7501) carry more than a title and a body:
+`ghostel-program-status-functions` runs with `(ID OLD NEW)`, NEW a plist
+with `:state`, `:kind`, `:msg` and more, ID `""` for the program itself
+and anything else for a child such as a Claude Code subagent.  A member
+there can answer a permission prompt from the banner, keep one banner
+per record, update it when a later report in the same state adds a
+message (Claude Code sends `done` first and a summary a moment later)
+and close it when the state changes or the record goes.  The keys are
+Claude Code's: Enter accepts the highlighted option, Esc declines and
+returns to the input.
+
+```elisp
+(defvar-local my-ghostel-status-notifications nil
+  "Alist of (RECORD-ID . NOTIFICATION-ID).")
+
+(defun my-ghostel-status-notify (id old new)
+  (let* ((root (equal id ""))
+         (state (plist-get new :state))
+         (nid (alist-get id my-ghostel-status-notifications nil nil #'equal))
+         (same (and nid (eq state (plist-get old :state)))))
+    (when (and nid (not same))
+      (macos-notifications-close nid)
+      (setf (alist-get id my-ghostel-status-notifications nil t #'equal) nil))
+    ;; Any record blocked or in error notifies, done only the root.
+    (when (or same
+              (and (ghostel-status-attention-p old new)
+                   (or root (memq state '(blocked error)))))
+      (let ((buf (current-buffer))
+            (show (macos-notifications-show-buffer))
+            (permission (and root (eq (plist-get new :kind) 'permission))))
+        (setf (alist-get id my-ghostel-status-notifications nil nil #'equal)
+              (macos-notifications-notify
+               :replaces-id (and same nid)
+               :title (or (plist-get new :title) (ghostel-status-app id)
+                          (buffer-name))
+               :body (or (plist-get new :msg) (symbol-name state))
+               :actions (and permission '("allow" "Allow" "deny" "Deny"))
+               :reply (and root "Tell Claude…")
+               :on-action (lambda (nid key)
+                            (with-current-buffer buf
+                              (pcase key
+                                ("allow" (ghostel-send-key "return"))
+                                ("deny" (ghostel-send-key "escape"))
+                                (_ (funcall show nid key)))))
+               :on-reply (lambda (_nid text)
+                           (with-current-buffer buf
+                             (when permission (ghostel-send-key "escape"))
+                             (ghostel-send-string text)
+                             (ghostel-send-key "return")))))))))
+
+(with-eval-after-load 'ghostel-status
+  (remove-hook 'ghostel-program-status-functions #'ghostel-status-notify)
+  (add-hook 'ghostel-program-status-functions #'my-ghostel-status-notify))
 ```
 
 ## Limits
