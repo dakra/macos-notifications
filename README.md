@@ -168,5 +168,8 @@ returns to the input.
   on it then does nothing; the callback is gone.
 - With several Emacs.app instances running, macOS delivers every click to
   one of them, not necessarily the one that posted the notification.
+  Each instance registers its own button sets, replacing the others'; they
+  are re-registered with every notification, so a banner posted after
+  another instance's keeps its buttons.
 - `emacs -nw` and `--batch` signal a `user-error`; a daemon works once it
   has a GUI frame.

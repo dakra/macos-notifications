@@ -175,20 +175,28 @@ id_string (emacs_env *env, emacs_value v)
   return [NSString stringWithFormat:@"%d-%jd", getpid (), id];
 }
 
-/* (ACTIONS REPLY DISMISS) -> registered category.  */
-static NSMutableDictionary<NSArray *, UNNotificationCategory *> *categories;
+/* Categories by identifier, one per (ACTIONS REPLY DISMISS) used.  */
+static NSMutableDictionary<NSString *, UNNotificationCategory *> *categories;
 
 /* Identifier of the category with ACTIONS (key, label, ...), a text
-   field with placeholder REPLY and a reported DISMISS, registering it
-   with the center on first use.  nil when no category is needed.  */
+   field with placeholder REPLY and a reported DISMISS, nil when no
+   category is needed.  macOS keeps one category set per app bundle and
+   another Emacs.app process replaces it with its own, after which
+   notifications with an unknown category show no buttons.  Hence
+   identifiers derived from the contents, so all processes agree on
+   them, and the whole set re-registered on every call.  */
 static NSString *
 category_for (NSArray<NSString *> *actions, NSString *reply, BOOL dismiss)
 {
   if (actions.count == 0 && reply == nil && !dismiss)
     return nil;
-  NSArray *key = @[ actions, reply ?: @"", @(dismiss) ];
-  UNNotificationCategory *category = categories[key];
-  if (category == nil)
+  NSData *json = [NSJSONSerialization
+                   dataWithJSONObject:@[ actions, reply ?: NSNull.null, @(dismiss) ]
+                              options:0 error:NULL];
+  NSString *ident = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+  if (categories == nil)
+    categories = [NSMutableDictionary new];
+  if (categories[ident] == nil)
     {
       NSMutableArray *list = [NSMutableArray new];
       for (NSUInteger i = 0; i + 1 < actions.count; i += 2)
@@ -201,19 +209,15 @@ category_for (NSArray<NSString *> *actions, NSString *reply, BOOL dismiss)
                                                                     options:0
                                                        textInputButtonTitle:@"Send"
                                                        textInputPlaceholder:reply]];
-      if (categories == nil)
-        categories = [NSMutableDictionary new];
-      NSString *ident = [NSString stringWithFormat:@"macos-notifications-%lu",
-                                  (unsigned long) categories.count];
-      category = [UNNotificationCategory categoryWithIdentifier:ident
-                                                        actions:list
-                                              intentIdentifiers:@[]
-                                                        options:(dismiss ? UNNotificationCategoryOptionCustomDismissAction : 0)];
-      categories[key] = category;
-      [[UNUserNotificationCenter currentNotificationCenter]
-        setNotificationCategories:[NSSet setWithArray:categories.allValues]];
+      categories[ident]
+        = [UNNotificationCategory categoryWithIdentifier:ident
+                                                 actions:list
+                                       intentIdentifiers:@[]
+                                                 options:(dismiss ? UNNotificationCategoryOptionCustomDismissAction : 0)];
     }
-  return category.identifier;
+  [[UNUserNotificationCenter currentNotificationCenter]
+    setNotificationCategories:[NSSet setWithArray:categories.allValues]];
+  return ident;
 }
 
 /* Attachment for the image file at PATH, copied first because the
