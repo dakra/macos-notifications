@@ -10,12 +10,16 @@
 ;;; Commentary:
 
 ;; ERT test suite.  Run with `make test'.  The click path itself needs a
-;; human; see the checklist in PLAN.md.
+;; human.
 
 ;;; Code:
 
 (require 'ert)
 (require 'macos-notifications)
+
+(declare-function macos-notifications--notify "macos-notifications-module")
+
+(macos-notifications--ensure-module)
 
 (defun macos-notifications-tests--run-timers ()
   "Run the pending callback timers."

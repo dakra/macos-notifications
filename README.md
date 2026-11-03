@@ -24,8 +24,9 @@ notification permission, click lands in Lisp.
 (package-vc-install "https://github.com/dakra/macos-notifications")
 ```
 
-The first `(require 'macos-notifications)` offers to compile the module;
-`make` in the package directory does the same.
+Then `M-x macos-notifications-module-compile`, or `make` in the package
+directory, builds the module.  Until then `macos-notifications-notify`
+signals a `user-error` saying so.
 
 ## Usage
 

@@ -39,37 +39,39 @@
 (require 'cl-lib)
 (require 'url-util)
 
-(unless (eq system-type 'darwin)
-  (user-error "The macos-notifications package only works on macOS"))
-
-(unless module-file-suffix
-  (error "Module support not detected, macos-notifications can't work"))
-
 (defconst macos-notifications--dir
   (file-name-directory (or load-file-name buffer-file-name
                            (locate-library "macos-notifications")))
   "Directory containing the macos-notifications dynamic module source.")
 
+;;;###autoload
 (defun macos-notifications-module-compile ()
-  "Compile the macos-notifications dynamic module."
+  "Compile the macos-notifications dynamic module with `make'.
+A module already loaded into this Emacs stays in use until restart."
   (interactive)
   (let ((default-directory macos-notifications--dir)
         (buffer (get-buffer-create "*macos-notifications-module-compile*")))
     (message "Compiling the macos-notifications dynamic module...")
     (if (zerop (call-process "make" nil buffer t
                              (concat "macos-notifications-module" module-file-suffix)))
-        (message "Compiling the macos-notifications dynamic module...done")
+        (message "Compiling the macos-notifications dynamic module...done%s"
+                 (if (featurep 'macos-notifications-module)
+                     "; restart Emacs to load it" ""))
       (pop-to-buffer buffer)
       (error "Compilation of the macos-notifications dynamic module failed"))))
 
-(unless (require 'macos-notifications-module nil t)
-  (if (or noninteractive
-          (y-or-n-p "The macos-notifications dynamic module is not compiled.  Compile it now? "))
-      (progn
-        (macos-notifications-module-compile)
-        (require 'macos-notifications-module))
-    (error "The macos-notifications module is not compiled; run `make' in %s"
-           macos-notifications--dir)))
+(defun macos-notifications--ensure-module ()
+  "Load the dynamic module, signaling a `user-error' when it is not compiled."
+  (unless (featurep 'macos-notifications-module)
+    (unless module-file-suffix
+      (error "This Emacs has no dynamic module support"))
+    (unless (file-exists-p (expand-file-name
+                            (concat "macos-notifications-module" module-file-suffix)
+                            macos-notifications--dir))
+      (user-error "The macos-notifications module is not compiled; \
+run M-x macos-notifications-module-compile"))
+    (let ((load-path (cons macos-notifications--dir load-path)))
+      (require 'macos-notifications-module))))
 
 (declare-function macos-notifications--open "macos-notifications-module")
 (declare-function macos-notifications--notify "macos-notifications-module")
@@ -185,6 +187,7 @@ ON-REPLY with (ID TEXT) for an entered reply; ON-CLOSE with
   (macos-notifications--check-actions actions)
   (unless (cl-some (lambda (f) (eq (window-system f) 'ns)) (frame-list))
     (user-error "Notifications need a GUI Emacs.app frame"))
+  (macos-notifications--ensure-module)
   (macos-notifications--ensure-channel)
   (let ((id (or replaces-id (cl-incf macos-notifications--counter))))
     (macos-notifications--notify id (or title "") (or body "") sound
@@ -200,7 +203,8 @@ ON-REPLY with (ID TEXT) for an entered reply; ON-CLOSE with
 (defun macos-notifications-close (id)
   "Remove notification ID from Notification Center."
   (remhash id macos-notifications--callbacks)
-  (macos-notifications--close id))
+  (when (featurep 'macos-notifications-module)
+    (macos-notifications--close id)))
 
 (defun macos-notifications-show-buffer (&optional buffer)
   "Return an `:on-action' function that shows BUFFER, default the current one.
