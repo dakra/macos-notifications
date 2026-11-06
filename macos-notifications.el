@@ -37,7 +37,6 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'url-util)
 
 (defconst macos-notifications--dir
   (file-name-directory (or load-file-name buffer-file-name
@@ -60,22 +59,33 @@ A module already loaded into this Emacs stays in use until restart."
       (pop-to-buffer buffer)
       (error "Compilation of the macos-notifications dynamic module failed"))))
 
+(defun macos-notifications--check-module ()
+  "Signal a `user-error' when the module is not compiled or older than its source."
+  (let ((module (expand-file-name
+                 (concat "macos-notifications-module" module-file-suffix)
+                 macos-notifications--dir))
+        (source (expand-file-name "macos-notifications-module.m"
+                                  macos-notifications--dir)))
+    (unless (file-exists-p module)
+      (user-error "The macos-notifications module is not compiled; \
+run M-x macos-notifications-module-compile"))
+    (when (file-newer-than-file-p source module)
+      (user-error "The macos-notifications module is older than its source; \
+run M-x macos-notifications-module-compile"))))
+
 (defun macos-notifications--ensure-module ()
-  "Load the dynamic module, signaling a `user-error' when it is not compiled."
+  "Load the dynamic module, signaling a `user-error' when it is not usable."
   (unless (featurep 'macos-notifications-module)
     (unless module-file-suffix
       (error "This Emacs has no dynamic module support"))
-    (unless (file-exists-p (expand-file-name
-                            (concat "macos-notifications-module" module-file-suffix)
-                            macos-notifications--dir))
-      (user-error "The macos-notifications module is not compiled; \
-run M-x macos-notifications-module-compile"))
+    (macos-notifications--check-module)
     (let ((load-path (cons macos-notifications--dir load-path)))
       (require 'macos-notifications-module))))
 
 (declare-function macos-notifications--open "macos-notifications-module")
 (declare-function macos-notifications--notify "macos-notifications-module")
 (declare-function macos-notifications--close "macos-notifications-module")
+(declare-function macos-notifications--flush "macos-notifications-module")
 
 (defvar macos-notifications--counter 0
   "Last notification id handed out.")
@@ -104,23 +114,36 @@ run M-x macos-notifications-module-compile"))
   (when fn
     (apply #'run-at-time 0 nil #'macos-notifications--run-callback fn args)))
 
+(defun macos-notifications--unregister (id)
+  "Forget the callbacks of notification ID."
+  (remhash id macos-notifications--callbacks)
+  (setq macos-notifications--ids (delete id macos-notifications--ids)))
+
+(defun macos-notifications--decode (field)
+  "Return the text of FIELD, a line field the module encoded."
+  (decode-coding-string (base64-decode-string field) 'utf-8))
+
 (defun macos-notifications--dispatch (line)
   "Handle one event LINE from the module."
   (pcase (split-string line " ")
-    ('("auth" "denied")
-     (message "Notifications for Emacs are disabled; allow Emacs in \
-System Settings > Notifications"))
-    (`("auth" ,_))
+    (`("denied" ,id)
+     (macos-notifications--unregister (string-to-number id))
+     (message "Notifications for Emacs are not allowed; allow them in \
+the permission prompt or in System Settings > Notifications"))
+    ;; The callbacks stay: the notification may be delivered all the
+    ;; same, for instance without its image.
+    (`("error" ,_id ,description)
+     (message "macos-notifications post error: %s"
+              (macos-notifications--decode description)))
     (`(,id ,key . ,rest)
      (let ((id (string-to-number id)))
        (pcase-let ((`(,on-action ,on-reply ,on-close)
                     (gethash id macos-notifications--callbacks)))
-         (remhash id macos-notifications--callbacks)
+         (macos-notifications--unregister id)
          (pcase key
            ("reply"
             (macos-notifications--schedule
-             on-reply id
-             (decode-coding-string (url-unhex-string (or (car rest) "") t) 'utf-8)))
+             on-reply id (macos-notifications--decode (or (car rest) ""))))
            ("dismiss" (macos-notifications--schedule on-close id 'dismissed))
            (_ (macos-notifications--schedule on-action id key))))))))
 
@@ -130,24 +153,38 @@ System Settings > Notifications"))
     (setq macos-notifications--pending (car (last lines)))
     (dolist (line (butlast lines))
       (unless (equal line "")
-        (macos-notifications--dispatch line)))))
+        (condition-case err
+            (macos-notifications--dispatch line)
+          (error (message "macos-notifications event error: %S" err)))))))
 
 (defun macos-notifications--ensure-channel ()
   "Create the pipe process and hand it to the module unless it is alive."
   (unless (process-live-p macos-notifications--process)
-    (let ((process (make-pipe-process :name "macos-notifications" :noquery t
-                                      :filter #'macos-notifications--filter)))
+    (let ((process
+           ;; Before Emacs 31 a pipe process cannot be created without
+           ;; a buffer.
+           (let ((buffer (generate-new-buffer " *macos-notifications*" t)))
+             (unwind-protect
+                 (let ((process (make-pipe-process
+                                 :name "macos-notifications" :buffer buffer
+                                 :coding 'utf-8-unix :noquery t
+                                 :filter #'macos-notifications--filter)))
+                   (set-process-buffer process nil)
+                   process)
+               (kill-buffer buffer)))))
       (condition-case err
           (macos-notifications--open process)
         (error (delete-process process)
                (signal (car err) (cdr err))))
+      ;; Late, for a notification posted from `kill-emacs-hook'.
+      (add-hook 'kill-emacs-hook #'macos-notifications--flush 90)
       (setq macos-notifications--pending ""
             macos-notifications--process process))))
 
 (defun macos-notifications--register (id callbacks)
   "Store CALLBACKS for ID, keeping only the newest 256 ids."
   (puthash id callbacks macos-notifications--callbacks)
-  (setq macos-notifications--ids (cons id (delq id macos-notifications--ids)))
+  (setq macos-notifications--ids (cons id (delete id macos-notifications--ids)))
   (let ((tail (nthcdr 255 macos-notifications--ids)))
     (dolist (old (cdr tail))
       (remhash old macos-notifications--callbacks))
@@ -197,15 +234,16 @@ ON-REPLY with (ID TEXT) for an entered reply; ON-CLOSE with
     (setq macos-notifications--counter (max macos-notifications--counter id))
     (if (or on-action on-reply on-close)
         (macos-notifications--register id (list on-action on-reply on-close))
-      (remhash id macos-notifications--callbacks))
+      (macos-notifications--unregister id))
     id))
 
 (defun macos-notifications-close (id)
   "Remove notification ID from Notification Center."
-  (remhash id macos-notifications--callbacks)
+  (macos-notifications--unregister id)
   (when (featurep 'macos-notifications-module)
     (macos-notifications--close id)))
 
+;;;###autoload
 (defun macos-notifications-show-buffer (&optional buffer)
   "Return an `:on-action' function that shows BUFFER, default the current one.
 Selects the window already showing BUFFER, else pops to it, and

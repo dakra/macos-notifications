@@ -18,6 +18,7 @@
 (require 'macos-notifications)
 
 (declare-function macos-notifications--notify "macos-notifications-module")
+(declare-function macos-notifications--flush "macos-notifications-module")
 
 (macos-notifications--ensure-module)
 
@@ -52,11 +53,24 @@
                         (lambda (id text) (push (list 'reply id text) calls))
                         (lambda (id reason) (push (list 'close id reason) calls)))
                macos-notifications--callbacks))
-    (macos-notifications--filter nil "1 reply h%C3%A9%20x\n2 dismiss\n3 reply \n")
+    (macos-notifications--filter nil "1 reply aMOpIHg=\n2 dismiss\n3 reply \n")
     (macos-notifications-tests--run-timers)
     (should (equal (nreverse calls)
                    '((reply 1 "hé x") (close 2 dismissed) (reply 3 ""))))
     (should (zerop (hash-table-count macos-notifications--callbacks)))))
+
+(ert-deftest macos-notifications-tests-bad-line-skipped ()
+  (let ((macos-notifications--callbacks (make-hash-table))
+        (macos-notifications--pending "")
+        (debug-on-error t)
+        (calls nil))
+    (dolist (id '(1 2))
+      (puthash id (list (lambda (id key) (push (list id key) calls))
+                        (lambda (id text) (push (list id text) calls)))
+               macos-notifications--callbacks))
+    (macos-notifications--filter nil "1 reply (null)\n2 default\n")
+    (macos-notifications-tests--run-timers)
+    (should (equal calls '((2 "default"))))))
 
 (ert-deftest macos-notifications-tests-check-actions ()
   (macos-notifications--check-actions nil)
@@ -75,6 +89,17 @@
                 :type 'wrong-type-argument)
   (should-error (macos-notifications--notify "1" "t" "b" nil nil nil nil nil nil)
                 :type 'wrong-type-argument))
+
+(ert-deftest macos-notifications-tests-module-invalid-strings ()
+  (let ((surrogate (string #xd83d)))
+    (dolist (args `((,surrogate "b" nil nil nil nil nil nil)
+                    ("t" ,surrogate nil nil nil nil nil nil)
+                    ("t" "b" ,surrogate nil nil nil nil nil)
+                    ("t" "b" nil ["key" ,surrogate] nil t nil nil)
+                    ("t" "b" nil nil ,surrogate nil nil nil)
+                    ("t" "b" nil nil nil nil nil ,surrogate)))
+      (should (equal (should-error (apply #'macos-notifications--notify 1 args))
+                     '(error "String is not valid UTF-8"))))))
 
 (ert-deftest macos-notifications-tests-callback-error-reported ()
   (let ((macos-notifications--callbacks (make-hash-table))
@@ -101,14 +126,79 @@
                      (cons 3 (cl-remove-if (lambda (id) (zerop (% id 7)))
                                            (number-sequence 46 300))))))))
 
-(ert-deftest macos-notifications-tests-auth-lines ()
+(ert-deftest macos-notifications-tests-finished-ids-free-their-slot ()
+  (let ((macos-notifications--callbacks (make-hash-table))
+        (macos-notifications--ids nil)
+        (macos-notifications--pending ""))
+    (cl-letf (((symbol-function 'macos-notifications--close) #'ignore))
+      (macos-notifications--register 1 (list nil))
+      (dotimes (i 300)
+        (let ((id (+ 2 i)))
+          (macos-notifications--register id (list nil))
+          (if (zerop (% i 2))
+              (macos-notifications--filter nil (format "%d default\n" id))
+            (macos-notifications-close id))))
+      (macos-notifications--register 400 (list nil))
+      (macos-notifications--filter nil "denied 400\n"))
+    (should (gethash 1 macos-notifications--callbacks))
+    (should (equal macos-notifications--ids '(1)))))
+
+(ert-deftest macos-notifications-tests-channel-process ()
+  (let ((macos-notifications--process nil)
+        (opened nil))
+    (cl-letf (((symbol-function 'macos-notifications--open)
+               (lambda (process) (setq opened process))))
+      (unwind-protect
+          (progn
+            (macos-notifications--ensure-channel)
+            (should (eq opened macos-notifications--process))
+            (should (memq #'macos-notifications--flush kill-emacs-hook))
+            (should (process-live-p opened))
+            (should-not (process-buffer opened))
+            (should-not (get-buffer " *macos-notifications*"))
+            (should (equal (process-coding-system opened)
+                           '(utf-8-unix . utf-8-unix))))
+        (when opened (delete-process opened))))))
+
+(ert-deftest macos-notifications-tests-stale-module ()
+  (let* ((macos-notifications--dir (file-name-as-directory
+                                    (make-temp-file "macos-notifications" t)))
+         (module (expand-file-name (concat "macos-notifications-module"
+                                           module-file-suffix)
+                                   macos-notifications--dir))
+         (source (expand-file-name "macos-notifications-module.m"
+                                   macos-notifications--dir)))
+    (unwind-protect
+        (progn
+          (should (string-match-p
+                   "not compiled"
+                   (cadr (should-error (macos-notifications--check-module)
+                                       :type 'user-error))))
+          (write-region "" nil module nil 'silent)
+          (write-region "" nil source nil 'silent)
+          (set-file-times module (time-subtract nil 60))
+          (should (string-match-p
+                   "older than its source"
+                   (cadr (should-error (macos-notifications--check-module)
+                                       :type 'user-error))))
+          (set-file-times source (time-subtract nil 120))
+          (macos-notifications--check-module))
+      (delete-directory macos-notifications--dir t))))
+
+(ert-deftest macos-notifications-tests-post-errors ()
   (let ((macos-notifications--callbacks (make-hash-table))
         (macos-notifications--pending ""))
-    (puthash 0 (list #'ignore) macos-notifications--callbacks)
-    (macos-notifications--filter nil "auth granted\nauth denied\n")
-    (should (= 1 (hash-table-count macos-notifications--callbacks)))
-    (with-current-buffer (messages-buffer)
-      (should (string-match-p "System Settings" (buffer-string))))))
+    (dolist (id '(1 2 3))
+      (puthash id (list #'ignore) macos-notifications--callbacks))
+    (let ((start (with-current-buffer (messages-buffer) (point-max))))
+      (macos-notifications--filter nil "error 2 YmFkIGltYWdl\ndenied 1\n")
+      (with-current-buffer (messages-buffer)
+        (let ((logged (buffer-substring start (point-max))))
+          (should (string-match-p "System Settings" logged))
+          (should (string-match-p "post error: bad image" logged)))))
+    (should-not (gethash 1 macos-notifications--callbacks))
+    (should (gethash 2 macos-notifications--callbacks))
+    (should (gethash 3 macos-notifications--callbacks))))
 
 (ert-deftest macos-notifications-tests-show-buffer ()
   (let ((buf (generate-new-buffer "show"))

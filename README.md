@@ -3,9 +3,9 @@
 Native macOS notifications from Emacs, with clicks delivered back to
 Emacs Lisp.  The macOS counterpart of `notifications.el`.
 
-macOS hands a notification click only to the process that posted it, and
-only if that process installed a notification-center delegate.  Emacs's NS
-port installs none, so `display notification` via AppleScript can at best
+macOS hands a notification click to the app that posted it, and only if
+the app installed a notification-center delegate.  Emacs's NS port
+installs none, so `display notification` via AppleScript can at best
 activate Emacs, and external posters like terminal-notifier show their own
 icon and route the click through emacsclient.  This package loads a small
 dynamic module into Emacs.app that posts through `UNUserNotificationCenter`
@@ -25,8 +25,9 @@ notification permission, click lands in Lisp.
 ```
 
 Then `M-x macos-notifications-module-compile`, or `make` in the package
-directory, builds the module.  Until then `macos-notifications-notify`
-signals a `user-error` saying so.
+directory, builds the module.  `macos-notifications-notify` signals a
+`user-error` instead of loading a module that is missing or older than its
+source.
 
 ## Usage
 
@@ -165,12 +166,12 @@ returns to the input.
   choice.  Call `macos-notifications-close` from a timer if needed.
 - `:on-close` fires only for an explicit dismissal; a banner that slides
   away into the notification list is not one.
+- Before macOS 12, `:urgency low` is quiet only while Emacs is the
+  frontmost app.
 - A notification outlives the Emacs session that posted it, but a click
   on it then does nothing; the callback is gone.
 - With several Emacs.app instances running, macOS delivers every click to
-  one of them, not necessarily the one that posted the notification.
-  Each instance registers its own button sets, replacing the others'; they
-  are re-registered with every notification, so a banner posted after
-  another instance's keeps its buttons.
+  one of them, not necessarily the one that posted the notification; in
+  another instance the click does nothing.
 - `emacs -nw` and `--batch` signal a `user-error`; a daemon works once it
   has a GUI frame.
