@@ -91,7 +91,7 @@ run M-x macos-notifications-module-compile"))))
   "Last notification id handed out.")
 
 (defvar macos-notifications--callbacks (make-hash-table)
-  "Notification id -> list of `:on-action', `:on-reply' and `:on-close'.")
+  "Notification id -> list of post serial, `:on-action', `:on-reply', `:on-close'.")
 
 (defvar macos-notifications--ids nil
   "Ids with registered callbacks, newest first.")
@@ -123,29 +123,39 @@ run M-x macos-notifications-module-compile"))))
   "Return the text of FIELD, a line field the module encoded."
   (decode-coding-string (base64-decode-string field) 'utf-8))
 
+(defun macos-notifications--current-p (id serial)
+  "Return non-nil if the callbacks of ID belong to the post with SERIAL.
+SERIAL is a field of an event line."
+  (eql (string-to-number serial)
+       (car (gethash id macos-notifications--callbacks))))
+
 (defun macos-notifications--dispatch (line)
-  "Handle one event LINE from the module."
+  "Handle one event LINE from the module.
+An event of a post that was replaced leaves the callbacks alone."
   (pcase (split-string line " ")
-    (`("denied" ,id)
-     (macos-notifications--unregister (string-to-number id))
+    (`("denied" ,id ,serial)
+     (let ((id (string-to-number id)))
+       (when (macos-notifications--current-p id serial)
+         (macos-notifications--unregister id)))
      (message "Notifications for Emacs are not allowed; allow them in \
 the permission prompt or in System Settings > Notifications"))
     ;; The callbacks stay: the notification may be delivered all the
     ;; same, for instance without its image.
-    (`("error" ,_id ,description)
+    (`("error" ,_id ,_serial ,description)
      (message "macos-notifications post error: %s"
               (macos-notifications--decode description)))
-    (`(,id ,key . ,rest)
+    (`(,id ,serial ,key . ,rest)
      (let ((id (string-to-number id)))
-       (pcase-let ((`(,on-action ,on-reply ,on-close)
-                    (gethash id macos-notifications--callbacks)))
-         (macos-notifications--unregister id)
-         (pcase key
-           ("reply"
-            (macos-notifications--schedule
-             on-reply id (macos-notifications--decode (or (car rest) ""))))
-           ("dismiss" (macos-notifications--schedule on-close id 'dismissed))
-           (_ (macos-notifications--schedule on-action id key))))))))
+       (when (macos-notifications--current-p id serial)
+         (pcase-let ((`(,_ ,on-action ,on-reply ,on-close)
+                      (gethash id macos-notifications--callbacks)))
+           (macos-notifications--unregister id)
+           (pcase key
+             ("reply"
+              (macos-notifications--schedule
+               on-reply id (macos-notifications--decode (or (car rest) ""))))
+             ("dismiss" (macos-notifications--schedule on-close id 'dismissed))
+             (_ (macos-notifications--schedule on-action id key)))))))))
 
 (defun macos-notifications--filter (_process output)
   "Split OUTPUT into lines and dispatch each complete one."
@@ -226,14 +236,15 @@ ON-REPLY with (ID TEXT) for an entered reply; ON-CLOSE with
     (user-error "Notifications need a GUI Emacs.app frame"))
   (macos-notifications--ensure-module)
   (macos-notifications--ensure-channel)
-  (let ((id (or replaces-id (cl-incf macos-notifications--counter))))
-    (macos-notifications--notify id (or title "") (or body "") sound
-                                 (and actions (vconcat actions)) reply
-                                 (and on-close t) (eq urgency 'low)
-                                 (and image-path (expand-file-name image-path)))
+  (let* ((id (or replaces-id (cl-incf macos-notifications--counter)))
+         (serial (macos-notifications--notify
+                  id (or title "") (or body "") sound
+                  (and actions (vconcat actions)) reply
+                  (and on-close t) (eq urgency 'low)
+                  (and image-path (expand-file-name image-path)))))
     (setq macos-notifications--counter (max macos-notifications--counter id))
     (if (or on-action on-reply on-close)
-        (macos-notifications--register id (list on-action on-reply on-close))
+        (macos-notifications--register id (list serial on-action on-reply on-close))
       (macos-notifications--unregister id))
     id))
 

@@ -170,6 +170,9 @@ returns to the input.
   frontmost app.
 - A notification outlives the Emacs session that posted it, but a click
   on it then does nothing; the callback is gone.
+- A click, reply or dismissal on a notification that is being replaced
+  does nothing.  That is usually a moment, but can take seconds when
+  Notification Center is slow to answer.
 - With several Emacs.app instances running, macOS delivers every click to
   one of them, not necessarily the one that posted the notification; in
   another instance the click does nothing.

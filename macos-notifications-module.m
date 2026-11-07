@@ -75,13 +75,15 @@ encode (NSString *text)
    SESSION.ID.SERIAL with ID the Lisp id.  */
 static NSString *session;
 
-/* Lisp id in request identifier IDENT, nil unless this session posted
-   it: a notification outlives the session that posted it.  */
+/* "ID SERIAL", which names a post in its events, from request
+   identifier IDENT, nil unless this session posted it: a notification
+   outlives the session that posted it.  */
 static NSString *
-lisp_id (NSString *ident)
+event_ids (NSString *ident)
 {
   NSArray<NSString *> *parts = [ident componentsSeparatedByString:@"."];
-  return parts.count == 3 && [parts[0] isEqualToString:session] ? parts[1] : nil;
+  return (parts.count == 3 && [parts[0] isEqualToString:session]
+          ? [NSString stringWithFormat:@"%@ %@", parts[1], parts[2]] : nil);
 }
 
 /* Serial queue all posting and removing of notifications runs on, in
@@ -117,7 +119,7 @@ static dispatch_group_t pending;
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))handler
 {
-  NSString *ident = lisp_id (response.notification.request.identifier);
+  NSString *ident = event_ids (response.notification.request.identifier);
   NSString *action = response.actionIdentifier;
   NSString *line;
   if (ident == nil)
@@ -391,11 +393,11 @@ retract (UNUserNotificationCenter *center, NSString *id)
   [center removeDeliveredNotificationsWithIdentifiers:@[ ident ]];
 }
 
-/* Tell Lisp that a post with Lisp id ID had a problem.  */
+/* Tell Lisp that the post with event ids IDS had a problem.  */
 static void
-report_error (NSString *id, NSString *description)
+report_error (NSString *ids, NSString *description)
 {
-  channel_write ([NSString stringWithFormat:@"error %@ %@\n", id, encode (description)]);
+  channel_write ([NSString stringWithFormat:@"error %@ %@\n", ids, encode (description)]);
 }
 
 /* Attachment for the image file at PATH, nil on failure, with ERROR
@@ -529,13 +531,15 @@ Fnotify (emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
   /* An identifier serves one post only: the framework drops both
      notifications when one is posted with the identifier of another
      that is not delivered yet, or was just removed.  */
-  NSString *request_ident = [NSString stringWithFormat:@"%@.%@.%lld", session, ident, ++posts];
+  long long serial = ++posts;
+  NSString *request_ident = [NSString stringWithFormat:@"%@.%@.%lld", session, ident, serial];
+  NSString *ids = event_ids (request_ident);
   UNNotificationRequest *request
     = [UNNotificationRequest requestWithIdentifier:request_ident content:content trigger:nil];
   dispatch_group_async (pending, center_queue, ^{
       UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
       if (category != nil && !register_category (center, category))
-        report_error (ident, @"Cannot register the notification's buttons");
+        report_error (ids, @"Cannot register the notification's buttons");
       retract (center, ident);
       posted[ident] = request_ident;
       dispatch_group_enter (pending);
@@ -548,14 +552,14 @@ Fnotify (emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
                 [[NSFileManager defaultManager] removeItemAtURL:copy error:NULL];
               if ([error.domain isEqualToString:UNErrorDomain]
                   && error.code == UNErrorCodeNotificationsNotAllowed)
-                channel_write ([NSString stringWithFormat:@"denied %@\n", ident]);
+                channel_write ([NSString stringWithFormat:@"denied %@\n", ids]);
               else
-                report_error (ident, error.localizedDescription);
+                report_error (ids, error.localizedDescription);
             }
           dispatch_group_leave (pending);
         }];
     });
-  return nil_value (env);
+  return env->make_integer (env, serial);
 }
 
 static emacs_value
@@ -610,7 +614,7 @@ emacs_module_init (struct emacs_runtime *ert)
          "Route notification events into pipe PROCESS and install the delegate.\n\n"
          "(fn PROCESS)");
   defun (env, "macos-notifications--notify", 9, Fnotify,
-         "Post notification ID with TITLE and BODY.\n"
+         "Post notification ID with TITLE and BODY and return the post's serial.\n"
          "SOUND is nil, t for the default sound or a sound name.  ACTIONS is a\n"
          "vector of KEY LABEL strings.  REPLY is a placeholder string for a text\n"
          "field or nil.  DISMISS non-nil reports an explicit dismissal.  PASSIVE\n"
