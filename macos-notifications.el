@@ -3,6 +3,7 @@
 ;; Copyright (c) 2026 Daniel Kraus <daniel@kraus.my>
 
 ;; Author: Daniel Kraus <daniel@kraus.my>
+;; Assisted-by: Claude:claude-fable-5-1
 ;; URL: https://github.com/dakra/macos-notifications
 ;; Keywords: notifications, tools
 ;; Version: 0.1

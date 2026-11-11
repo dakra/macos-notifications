@@ -77,9 +77,9 @@ Notification Center.
 shows a buffer, the current one by default: it selects the window already
 showing it, else pops to it, and focuses that frame.
 
-### ghostel
+### Ghostel
 
-[ghostel](https://github.com/dakra/ghostel) runs
+[Ghostel](https://github.com/dakra/ghostel) runs
 `ghostel-notification-functions` with `(TITLE BODY)` for OSC 9 / OSC 777
 notifications and, through `ghostel-status-notify`, for program-status
 changes (OSC 7501, which Claude Code speaks), the terminal buffer current.
